@@ -112,7 +112,13 @@ pub struct Metadata {
 }
 
 /// Messages 请求体
-#[derive(Debug, Deserialize)]
+///
+/// 兼容接收 Anthropic / CLI 风格字段，但实际出站 Kiro 语义会在 converter 中收口：
+/// - `system` 仅用于兼容反序列化，转换时会丢弃，不会写入 Kiro history/body。
+/// - `metadata.user_id` 仅保留其 conversationId 派生作用。
+/// - `thinking` 会保留为受支持功能。
+/// - `tool_choice`、`output_config` 以及未来未显式支持的额外字段都不参与 Kiro 出站语义。
+#[derive(Debug, Deserialize, Clone)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: i32,

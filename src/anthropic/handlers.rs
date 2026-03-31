@@ -24,7 +24,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, Thinking};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -620,12 +620,6 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
-    if is_opus_4_6 {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-        });
-    }
 }
 
 /// POST /v1/messages/count_tokens
@@ -900,4 +894,32 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_override_thinking_from_model_name_does_not_set_output_config() {
+        let mut payload = MessagesRequest {
+            model: "claude-opus-4-6-thinking".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be set");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert!(payload.output_config.is_none());
+    }
 }

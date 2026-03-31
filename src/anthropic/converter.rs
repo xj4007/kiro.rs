@@ -72,6 +72,8 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+const DEFAULT_ADAPTIVE_THINKING_EFFORT: &str = "high";
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -196,7 +198,6 @@ fn create_placeholder_tool(name: &str) -> Tool {
     }
 }
 
-/// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
@@ -563,21 +564,15 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
                 t.budget_tokens
             ));
         } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
+                DEFAULT_ADAPTIVE_THINKING_EFFORT
             ));
         }
     }
     None
 }
 
-/// 检查内容是否已包含thinking标签
 fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
@@ -593,47 +588,15 @@ fn has_thinking_tags(content: &str) -> bool {
 fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
-    // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(req);
-
-    // 1. 处理系统消息
-    if let Some(ref system) = req.system {
-        let system_content: String = system
-            .iter()
-            .map(|s| s.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
-
-            // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
-                } else {
-                    system_content
-                }
-            } else {
-                system_content
-            };
-
-            // 系统消息作为 user + assistant 配对
-            let user_msg = HistoryUserMessage::new(final_content, model_id);
-            history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
-        }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
+    if let Some(prefix) = generate_thinking_prefix(req) {
+        let user_msg = HistoryUserMessage::new(prefix, model_id);
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
         history.push(Message::Assistant(assistant_msg));
     }
+
+    let _ = SYSTEM_CHUNKED_POLICY;
 
     // 2. 处理常规消息历史
     // 最后一条消息作为 currentMessage，不加入历史
@@ -915,6 +878,158 @@ mod tests {
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
+    }
+
+    #[test]
+    fn test_build_history_drops_client_system_but_keeps_thinking_prefix() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "client system should be dropped".to_string(),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 1234,
+            }),
+            output_config: Some(super::super::types::OutputConfig {
+                effort: "low".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let history = build_history(&req, &req.messages, "claude-sonnet-4.5").unwrap();
+        assert_eq!(history.len(), 2);
+
+        let Message::User(user_msg) = &history[0] else {
+            panic!("expected synthetic thinking user message");
+        };
+        assert!(user_msg.user_input_message.content.contains("<thinking_mode>enabled</thinking_mode>"));
+        assert!(user_msg.user_input_message.content.contains("<max_thinking_length>1234</max_thinking_length>"));
+        assert!(!user_msg.user_input_message.content.contains("client system should be dropped"));
+        assert!(!user_msg.user_input_message.content.contains(SYSTEM_CHUNKED_POLICY));
+
+        let Message::Assistant(assistant_msg) = &history[1] else {
+            panic!("expected synthetic assistant acknowledgement");
+        };
+        assert_eq!(assistant_msg.assistant_response_message.content, "I will follow these instructions.");
+    }
+
+    #[test]
+    fn test_build_history_adaptive_thinking_ignores_output_config_effort() {
+        use super::super::types::{Message as AnthropicMessage, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-6-thinking".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: Some(super::super::types::OutputConfig {
+                effort: "low".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let history = build_history(&req, &req.messages, "claude-opus-4.6").unwrap();
+        let Message::User(user_msg) = &history[0] else {
+            panic!("expected synthetic thinking user message");
+        };
+        assert!(user_msg.user_input_message.content.contains("<thinking_mode>adaptive</thinking_mode>"));
+        assert!(user_msg.user_input_message.content.contains("<thinking_effort>high</thinking_effort>"));
+        assert!(!user_msg.user_input_message.content.contains("<thinking_effort>low</thinking_effort>"));
+    }
+
+    #[test]
+    fn test_convert_request_ignores_tool_choice() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let base_messages = vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("Hello"),
+        }];
+
+        let without_tool_choice = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: base_messages.clone(),
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let with_tool_choice = MessagesRequest {
+            tool_choice: Some(serde_json::json!({"type": "tool", "name": "Read"})),
+            ..without_tool_choice.clone()
+        };
+
+        let baseline = serde_json::to_value(convert_request(&without_tool_choice).unwrap().conversation_state).unwrap();
+        let candidate = serde_json::to_value(convert_request(&with_tool_choice).unwrap().conversation_state).unwrap();
+
+        let baseline = strip_generated_ids(baseline);
+        let candidate = strip_generated_ids(candidate);
+        assert_eq!(baseline, candidate);
+    }
+
+    #[test]
+    fn test_convert_request_keeps_fixed_kiro_traits_without_client_system() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "drop me".to_string(),
+            }]),
+            tools: Some(vec![super::super::types::Tool {
+                tool_type: None,
+                name: "Read".to_string(),
+                description: "Read file".to_string(),
+                input_schema: std::collections::HashMap::new(),
+                max_uses: None,
+            }]),
+            tool_choice: Some(serde_json::json!("auto")),
+            thinking: None,
+            output_config: Some(super::super::types::OutputConfig {
+                effort: "low".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let state = convert_request(&req).unwrap().conversation_state;
+        assert_eq!(state.agent_task_type.as_deref(), Some("vibe"));
+        assert_eq!(state.chat_trigger_type.as_deref(), Some("MANUAL"));
+        assert_eq!(state.current_message.user_input_message.origin.as_deref(), Some("AI_EDITOR"));
+        assert_eq!(state.current_message.user_input_message.model_id, "claude-sonnet-4.5");
+        assert_eq!(state.current_message.user_input_message.user_input_message_context.tools.len(), 1);
+        assert!(state.history.is_empty());
     }
 
     #[test]
